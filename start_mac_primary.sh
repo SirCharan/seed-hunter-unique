@@ -27,14 +27,15 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Keep WORKERS_PER_SHARD=2 (coverage stripes). "Stronger" = more RPC per worker.
 export WORKERS_PER_SHARD="${WORKERS_PER_SHARD:-2}"
 export UNIQUE_WORDS="${UNIQUE_WORDS:-1}"
 export BACKEND="${BACKEND:-rpc}"
 export CHECK_MODE="${CHECK_MODE:-both}"
 export CHAINS="${CHAINS:-ethereum}"
-export BATCH_SIZE="${BATCH_SIZE:-20}"
-export MAX_CONCURRENT="${MAX_CONCURRENT:-6}"
-export RPC_RPS="${RPC_RPS:-15}"
+export BATCH_SIZE="${BATCH_SIZE:-40}"
+export MAX_CONCURRENT="${MAX_CONCURRENT:-12}"
+export RPC_RPS="${RPC_RPS:-25}"
 export SAVE_ACTIVITY="${SAVE_ACTIVITY:-1}"
 export ENRICH_ETHERSCAN="${ENRICH_ETHERSCAN:-1}"
 

@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import json
 import os
+import signal
 import sys
 import time
 from dataclasses import dataclass
@@ -277,10 +279,40 @@ def load_int(path: str) -> Optional[int]:
 
 
 def save_int(path: str, val: int) -> None:
+    """Atomic progress write + fsync so kill/reboot can resume the same index."""
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(str(val))
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+def phrase_path_for(progress_file: str) -> str:
+    if progress_file.endswith(".txt"):
+        return progress_file[: -len(".txt")] + ".phrase.txt"
+    return progress_file + ".phrase.txt"
+
+
+def save_progress_and_phrase(progress_file: str, idx: int, length: int = 12) -> str:
+    """Persist index + human-readable phrase for resume after crash/close."""
+    save_int(progress_file, idx)
+    phrase = "?"
+    try:
+        phrase = entropy_index_to_phrase(idx, length)
+    except Exception:
+        pass
+    ppath = phrase_path_for(progress_file)
+    tmp = ppath + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(f"{idx}\n{phrase}\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, ppath)
+    except OSError:
+        pass
+    return phrase
 
 
 def _parity_base(lo: int, parity: int) -> Optional[int]:
@@ -569,6 +601,40 @@ async def run(cfg: Config) -> int:
         print("No indices for this worker/shard — exiting.")
         return 0
 
+    # Resume banner: progress files survive Terminal quit / kill / reboot
+    try:
+        resume_phrase = entropy_index_to_phrase(idx, cfg.length)
+    except Exception:
+        resume_phrase = "?"
+    saved_before = load_int(cfg.progress_file)
+    if saved_before is not None:
+        print(f"RESUME from progress file {cfg.progress_file}")
+        print(f"RESUME idx={idx:,}")
+        print(f"RESUME phrase: {resume_phrase}")
+    else:
+        print(f"START fresh idx={idx:,}")
+        print(f"START phrase: {resume_phrase}")
+    save_progress_and_phrase(cfg.progress_file, idx, cfg.length)
+
+    # Last index flushed on SIGTERM/SIGINT/atexit so closed Terminal can resume
+    _last = {"idx": idx}
+
+    def _flush_progress() -> None:
+        cur = _last.get("idx")
+        if cur is not None:
+            try:
+                save_progress_and_phrase(cfg.progress_file, int(cur), cfg.length)
+            except Exception:
+                pass
+
+    def _on_signal(signum, _frame) -> None:
+        _flush_progress()
+        raise SystemExit(128 + int(signum))
+
+    atexit.register(_flush_progress)
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
+
     walked = 0  # entropy indices visited (includes unique-word skips)
     rpc_checked = 0  # phrases actually sent to RPC / Etherscan
     skipped_unique = 0
@@ -606,17 +672,14 @@ async def run(cfg: Config) -> int:
 
                 # Progress = next index after this batch (or last if done)
                 cur_idx = idx if idx is not None else batch_idx[-1]
-                save_int(cfg.progress_file, cur_idx)
+                _last["idx"] = cur_idx
+                phrase = save_progress_and_phrase(cfg.progress_file, cur_idx, cfg.length)
                 batch_idx = []
 
                 if walked % (cfg.batch_size * 2) == 0 or walked <= cfg.batch_size:
                     elapsed = time.time() - t0
                     walk_rate = walked / elapsed if elapsed > 0 else 0.0
                     rpc_rate = rpc_checked / elapsed if elapsed > 0 else 0.0
-                    try:
-                        phrase = entropy_index_to_phrase(cur_idx, cfg.length)
-                    except Exception:
-                        phrase = "?"
                     _progress_line(
                         cfg,
                         walked=walked,
@@ -639,25 +702,16 @@ async def run(cfg: Config) -> int:
                 if skip == 0:
                     rpc_checked += 1
                 cur_idx = idx
-                try:
-                    phrase = entropy_index_to_phrase(cur_idx, cfg.length)
-                except Exception:
-                    phrase = "?"
                 nxt = next_index(cfg, idx)
-                if nxt is not None:
-                    save_int(cfg.progress_file, nxt)
-                else:
-                    save_int(cfg.progress_file, idx)
+                save_idx = nxt if nxt is not None else idx
+                _last["idx"] = save_idx
+                phrase = save_progress_and_phrase(cfg.progress_file, save_idx, cfg.length)
                 idx = nxt
                 if walked % 10 == 0:
                     elapsed = time.time() - t0
                     walk_rate = walked / elapsed if elapsed > 0 else 0.0
                     rpc_rate = rpc_checked / elapsed if elapsed > 0 else 0.0
                     show_idx = load_int(cfg.progress_file) or cur_idx
-                    try:
-                        phrase = entropy_index_to_phrase(show_idx, cfg.length)
-                    except Exception:
-                        phrase = "?"
                     _progress_line(
                         cfg,
                         walked=walked,
