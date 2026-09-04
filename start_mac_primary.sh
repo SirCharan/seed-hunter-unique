@@ -13,10 +13,17 @@
 #   BACKEND=rpc
 #   FORCE_RESTART optional
 #
+# Architecture: ALWAYS exactly 4 shards (low_fwd/low_rev/high_fwd/high_rev).
+# Only WORKERS_PER_SHARD scales process count (= workers × 4).
+# MacBook Air safe: 2 (8 procs) or 3 (12). Max practical ~4–6 (16–24) if cool/plugged.
+# Do NOT raise WORKERS_PER_SHARD after progress files exist (reshuffles stripes).
+#
+# Always-on (plugged in): ./mac_always_on.sh   then keep lid open or use dummy HDMI.
+#
 # Usage:
 #   ./start_mac_primary.sh
 #   FORCE_RESTART=1 ./start_mac_primary.sh
-#   WORKERS_PER_SHARD=3 ./start_mac_primary.sh
+#   WORKERS_PER_SHARD=3 ./start_mac_primary.sh   # only before first progress, or accept reshuffle
 set -euo pipefail
 cd "$(dirname "$0")"
 

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 import time
@@ -350,6 +351,90 @@ def _print_activity(hit: dict, shard: str, idx: int) -> None:
     print(f"Phrase: {hit.get('phrase')}")
 
 
+def _status_path(progress_file: str) -> str:
+    # shard_low_fwd_w0.txt → shard_low_fwd_w0.status.json
+    if progress_file.endswith(".txt"):
+        return progress_file[: -len(".txt")] + ".status.json"
+    return progress_file + ".status.json"
+
+
+def write_worker_status(
+    cfg: Config,
+    *,
+    idx: int,
+    phrase: str,
+    walked: int,
+    rpc_checked: int,
+    skipped_unique: int,
+    walk_rate: float,
+    rpc_rate: float,
+    capital_total: int,
+    activity_total: int,
+) -> None:
+    """Atomic-ish status snapshot for status_shards.sh (best-effort)."""
+    path = _status_path(cfg.progress_file)
+    tmp = path + ".tmp"
+    payload = {
+        "shard": cfg.shard.name,
+        "worker_id": cfg.worker_id,
+        "workers": cfg.num_workers,
+        "idx": idx,
+        "phrase": phrase,
+        "unique": words_all_unique(phrase) if phrase else None,
+        "walked": walked,
+        "rpc_checked": rpc_checked,
+        "skipped_unique": skipped_unique,
+        "walk_rate": round(walk_rate, 2),
+        "rpc_rate": round(rpc_rate, 2),
+        "capital": capital_total,
+        "activity": activity_total,
+        "ts": time.time(),
+    }
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, separators=(",", ":"))
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _progress_line(
+    cfg: Config,
+    *,
+    walked: int,
+    rpc_checked: int,
+    skipped_unique: int,
+    walk_rate: float,
+    rpc_rate: float,
+    capital_total: int,
+    activity_total: int,
+    idx: int,
+    phrase: str,
+) -> None:
+    # Keep phrase on same \r line (truncate) so status_shards can tail logs too.
+    short = phrase if len(phrase) <= 80 else phrase[:77] + "..."
+    sys.stdout.write(
+        f"\r[{cfg.shard.name} w{cfg.worker_id}] walked={walked:,} "
+        f"rpc={rpc_checked:,} skipped_unique={skipped_unique:,} "
+        f"walk_rate={walk_rate:.2f}/s rpc_rate={rpc_rate:.2f}/s "
+        f"capital={capital_total} activity={activity_total} "
+        f"idx={idx} phrase={short}   "
+    )
+    sys.stdout.flush()
+    write_worker_status(
+        cfg,
+        idx=idx,
+        phrase=phrase,
+        walked=walked,
+        rpc_checked=rpc_checked,
+        skipped_unique=skipped_unique,
+        walk_rate=walk_rate,
+        rpc_rate=rpc_rate,
+        capital_total=capital_total,
+        activity_total=activity_total,
+    )
+
+
 async def process_batch_rpc(
     cfg: Config,
     rpc,
@@ -484,7 +569,8 @@ async def run(cfg: Config) -> int:
         print("No indices for this worker/shard — exiting.")
         return 0
 
-    checked = 0
+    walked = 0  # entropy indices visited (includes unique-word skips)
+    rpc_checked = 0  # phrases actually sent to RPC / Etherscan
     skipped_unique = 0
     capital_total = 0
     activity_total = 0
@@ -515,52 +601,79 @@ async def run(cfg: Config) -> int:
                 capital_total += cap
                 activity_total += act
                 skipped_unique += skip
-                # Advance progress for every index in batch (including unique-skipped).
-                checked += len(batch_idx)
+                walked += len(batch_idx)
+                rpc_checked += max(0, len(batch_idx) - skip)
 
                 # Progress = next index after this batch (or last if done)
-                if idx is not None:
-                    save_int(cfg.progress_file, idx)
-                else:
-                    save_int(cfg.progress_file, batch_idx[-1])
+                cur_idx = idx if idx is not None else batch_idx[-1]
+                save_int(cfg.progress_file, cur_idx)
                 batch_idx = []
 
-                if checked % (cfg.batch_size * 2) == 0 or checked <= cfg.batch_size:
+                if walked % (cfg.batch_size * 2) == 0 or walked <= cfg.batch_size:
                     elapsed = time.time() - t0
-                    rate = checked / elapsed if elapsed > 0 else 0.0
-                    sys.stdout.write(
-                        f"\r[{s.name} w{cfg.worker_id}] checked={checked:,} "
-                        f"skipped_unique={skipped_unique:,} "
-                        f"rate={rate:.2f}/s capital={capital_total} activity={activity_total} "
-                        f"idx={load_int(cfg.progress_file)}"
+                    walk_rate = walked / elapsed if elapsed > 0 else 0.0
+                    rpc_rate = rpc_checked / elapsed if elapsed > 0 else 0.0
+                    try:
+                        phrase = entropy_index_to_phrase(cur_idx, cfg.length)
+                    except Exception:
+                        phrase = "?"
+                    _progress_line(
+                        cfg,
+                        walked=walked,
+                        rpc_checked=rpc_checked,
+                        skipped_unique=skipped_unique,
+                        walk_rate=walk_rate,
+                        rpc_rate=rpc_rate,
+                        capital_total=capital_total,
+                        activity_total=activity_total,
+                        idx=cur_idx,
+                        phrase=phrase,
                     )
-                    sys.stdout.flush()
         else:
             client = EtherscanClient(cfg.api_keys, cfg.rate_limit)
             while idx is not None:
                 hits, skip = await process_one_etherscan(cfg, client, session, idx)
                 capital_total += hits
                 skipped_unique += skip
-                checked += 1
+                walked += 1
+                if skip == 0:
+                    rpc_checked += 1
+                cur_idx = idx
+                try:
+                    phrase = entropy_index_to_phrase(cur_idx, cfg.length)
+                except Exception:
+                    phrase = "?"
                 nxt = next_index(cfg, idx)
                 if nxt is not None:
                     save_int(cfg.progress_file, nxt)
                 else:
                     save_int(cfg.progress_file, idx)
                 idx = nxt
-                if checked % 10 == 0:
+                if walked % 10 == 0:
                     elapsed = time.time() - t0
-                    rate = checked / elapsed if elapsed > 0 else 0.0
-                    sys.stdout.write(
-                        f"\r[{s.name} w{cfg.worker_id}] checked={checked:,} "
-                        f"skipped_unique={skipped_unique:,} "
-                        f"rate={rate:.2f}/s hits={capital_total} idx={load_int(cfg.progress_file)}"
+                    walk_rate = walked / elapsed if elapsed > 0 else 0.0
+                    rpc_rate = rpc_checked / elapsed if elapsed > 0 else 0.0
+                    show_idx = load_int(cfg.progress_file) or cur_idx
+                    try:
+                        phrase = entropy_index_to_phrase(show_idx, cfg.length)
+                    except Exception:
+                        phrase = "?"
+                    _progress_line(
+                        cfg,
+                        walked=walked,
+                        rpc_checked=rpc_checked,
+                        skipped_unique=skipped_unique,
+                        walk_rate=walk_rate,
+                        rpc_rate=rpc_rate,
+                        capital_total=capital_total,
+                        activity_total=activity_total,
+                        idx=show_idx,
+                        phrase=phrase,
                     )
-                    sys.stdout.flush()
 
     print(
-        f"\n[{s.name} w{cfg.worker_id}] done. checked={checked:,} "
-        f"skipped_unique={skipped_unique:,} "
+        f"\n[{s.name} w{cfg.worker_id}] done. walked={walked:,} "
+        f"rpc={rpc_checked:,} skipped_unique={skipped_unique:,} "
         f"capital={capital_total} activity={activity_total}"
     )
     return 0

@@ -5,6 +5,7 @@ __pycache__/
 .DS_Store
 .env
 shard_*.txt
+shard_*.status.json
 shard_*.log
 ensure_alive.log
 *.log
