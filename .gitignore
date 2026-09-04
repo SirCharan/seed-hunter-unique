@@ -1,0 +1,12 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+.env
+shard_*.txt
+shard_*.log
+ensure_alive.log
+*.log
+.capital_git_push.lock
+nohup.out
